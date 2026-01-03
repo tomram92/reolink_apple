@@ -1,0 +1,13 @@
+{
+  "domain": "reolink",
+  "name": "Reolink (Apple HLS playback)",
+  "version": "1.0.0",
+  "documentation": "https://www.home-assistant.io/integrations/reolink",
+  "requirements": ["reolink-aio==0.17.1"],
+  "dependencies": ["http", "webhook"],
+  "config_flow": true,
+  "codeowners": ["@tomas"],
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "loggers": ["reolink_aio"]
+}
