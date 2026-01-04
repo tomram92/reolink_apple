@@ -1,7 +1,7 @@
 {
   "domain": "reolink",
-  "name": "Reolink (Apple HLS playback)",
-  "version": "1.0.0",
+  "name": "Reolink (go2rtc playback interceptor)",
+  "version": "0.0.2",
   "documentation": "https://www.home-assistant.io/integrations/reolink",
   "requirements": ["reolink-aio==0.17.1"],
   "dependencies": ["http", "webhook"],
