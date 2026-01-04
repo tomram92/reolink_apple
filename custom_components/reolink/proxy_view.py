@@ -1,4 +1,4 @@
-"""Proxy Reolink VOD through HLS and MP4 Range endpoints."""
+"""Proxy Reolink VOD through MP4 Range endpoints."""
 
 from __future__ import annotations
 
@@ -7,9 +7,6 @@ from contextlib import suppress
 from http import HTTPStatus
 import logging
 import os
-from pathlib import Path
-import secrets
-import time
 import urllib.parse
 from urllib.parse import quote, unquote
 
@@ -27,19 +24,6 @@ from .util import get_host
 _LOGGER = logging.getLogger(__name__)
 
 CHUNK_SIZE = 64 * 1024
-HLS_TIME = 1
-HLS_LIST_SIZE = 4
-HLS_SEGMENT_TYPE = "fmp4"
-HLS_FLAGS = "append_list+omit_endlist+independent_segments"
-HLS_READY_TIMEOUT = float(os.getenv("REOLINK_HLS_READY_TIMEOUT", "20"))
-STREAM_TTL_SECONDS = 300
-DEFAULT_TRANSCODE = os.getenv("REOLINK_HLS_TRANSCODE", "0") not in (
-    "0",
-    "false",
-    "False",
-    "",
-    None,
-)
 IGNORE_RANGE = os.getenv("REOLINK_MP4_IGNORE_RANGE", "1") not in (
     "0",
     "false",
@@ -48,23 +32,10 @@ IGNORE_RANGE = os.getenv("REOLINK_MP4_IGNORE_RANGE", "1") not in (
     None,
 )
 
-STREAMS: dict[str, dict[str, object]] = {}
-STREAMS_LOCK = asyncio.Lock()
-_CLEANUP_TASK: asyncio.Task | None = None
 LENGTH_CACHE: dict[str, int] = {}
 LENGTH_CACHE_LOCK = asyncio.Lock()
 SIZE_CACHE: dict[str, int] = {}
 SIZE_CACHE_LOCK = asyncio.Lock()
-
-
-async def _log_ffmpeg_stderr(proc: asyncio.subprocess.Process, token: str) -> None:
-    if proc.stderr is None:
-        return
-    while True:
-        line = await proc.stderr.readline()
-        if not line:
-            break
-        _LOGGER.warning("ffmpeg[%s] %s", token, line.decode(errors="replace").rstrip())
 
 
 def _parse_identifier(
@@ -322,259 +293,6 @@ async def _search_file_size(
     return None
 
 
-def _stream_root(hass: HomeAssistant) -> Path:
-    return Path(hass.config.path("reolink_hls"))
-
-
-async def _ensure_cleanup_task(hass: HomeAssistant) -> None:
-    global _CLEANUP_TASK
-    if _CLEANUP_TASK is not None and not _CLEANUP_TASK.done():
-        return
-
-    async def _cleanup_loop() -> None:
-        while True:
-            await asyncio.sleep(10)
-            now = time.time()
-            stale: list[str] = []
-            async with STREAMS_LOCK:
-                for token, data in STREAMS.items():
-                    if now - data["last_access"] > STREAM_TTL_SECONDS:
-                        stale.append(token)
-            for token in stale:
-                await _stop_stream(token)
-
-    _CLEANUP_TASK = hass.loop.create_task(_cleanup_loop())
-
-
-async def _stop_stream(token: str) -> None:
-    async with STREAMS_LOCK:
-        data = STREAMS.pop(token, None)
-    if not data:
-        return
-
-    _LOGGER.info("Stopping HLS stream %s", token)
-    proc: asyncio.subprocess.Process = data["process"]
-    if proc.returncode is None:
-        proc.terminate()
-        with suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(proc.wait(), timeout=3)
-    if proc.returncode is None:
-        proc.kill()
-        with suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(proc.wait(), timeout=1)
-
-    stream_dir: Path = data["dir"]
-    with suppress(OSError):
-        for item in stream_dir.glob("*"):
-            with suppress(OSError):
-                item.unlink()
-        stream_dir.rmdir()
-
-
-async def _spawn_hls(hass: HomeAssistant, clip_url: str, transcode: bool) -> str:
-    token = secrets.token_hex(8)
-    stream_dir = _stream_root(hass) / token
-    stream_dir.mkdir(parents=True, exist_ok=True)
-
-    playlist = stream_dir / "index.m3u8"
-    segment_pattern = stream_dir / "seg%03d.m4s"
-    init_name = "init.mp4"
-
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostdin",
-        "-i",
-        clip_url,
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a:0?",
-        "-f",
-        "hls",
-        "-hls_time",
-        str(HLS_TIME),
-        "-hls_list_size",
-        str(HLS_LIST_SIZE),
-        "-hls_flags",
-        HLS_FLAGS,
-        "-hls_segment_type",
-        HLS_SEGMENT_TYPE,
-        "-hls_fmp4_init_filename",
-        init_name,
-        "-hls_segment_filename",
-        str(segment_pattern),
-        str(playlist),
-    ]
-    insert_at = cmd.index("-f")
-    if transcode:
-        cmd[insert_at:insert_at] = [
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "22",
-            "-profile:v",
-            "high",
-            "-level",
-            "4.1",
-            "-pix_fmt",
-            "yuv420p",
-            "-g",
-            "100",
-            "-keyint_min",
-            "100",
-            "-sc_threshold",
-            "0",
-            "-c:a",
-            "aac",
-            "-ac",
-            "2",
-            "-ar",
-            "44100",
-            "-b:a",
-            "128k",
-        ]
-    else:
-        cmd[insert_at:insert_at] = [
-            "-c:v",
-            "copy",
-            "-c:a",
-            "copy",
-        ]
-
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    asyncio.create_task(_log_ffmpeg_stderr(process, token))
-
-    async with STREAMS_LOCK:
-        STREAMS[token] = {
-            "dir": stream_dir,
-            "process": process,
-            "last_access": time.time(),
-        }
-
-    _LOGGER.info("Started HLS stream %s for %s", token, clip_url)
-    return token
-
-
-async def _wait_hls_ready(
-    data: dict[str, object], filename: str
-) -> tuple[Path | None, int, str | None]:
-    file_path = Path(data["dir"]) / filename
-    proc: asyncio.subprocess.Process = data["process"]
-
-    start_wait = time.time()
-    while time.time() - start_wait < HLS_READY_TIMEOUT:
-        if file_path.is_file():
-            break
-        if proc.returncode is not None:
-            return None, 502, f"ffmpeg exited early (code {proc.returncode})"
-        await asyncio.sleep(0.2)
-    if not file_path.is_file():
-        return None, 503, "HLS output not ready"
-
-    if filename.endswith(".m3u8"):
-        start_wait = time.time()
-        while time.time() - start_wait < HLS_READY_TIMEOUT:
-            content = await asyncio.to_thread(file_path.read_text)
-            segments = [line for line in content.splitlines() if line and not line.startswith("#")]
-            if len(segments) >= 1:
-                break
-            await asyncio.sleep(0.2)
-        else:
-            return None, 503, "Playlist not ready"
-
-    return file_path, 200, None
-
-
-class ReolinkFfmpegHlsView(HomeAssistantView):
-    """Proxy Reolink clips through ffmpeg and serve as HLS."""
-
-    requires_auth = True
-    url = "/api/reolink_proxy/hls/{identifier:.*}"
-    name = "api:reolink_proxy_hls"
-
-    def __init__(self, hass: HomeAssistant) -> None:
-        self.hass = hass
-
-    async def get(self, request: web.Request, identifier: str) -> web.StreamResponse:
-        """Fetch a Reolink clip and re-mux it for HLS playback."""
-        _LOGGER.info("Reolink ffmpeg HLS proxy request received")
-        try:
-            _LOGGER.debug("Reolink ffmpeg HLS proxy identifier=%s", identifier)
-            clip_url, _vod_type, _ = await _resolve_clip_url(self.hass, identifier)
-        except (ValueError, Unresolvable, ReolinkError) as err:
-            _LOGGER.warning("Reolink ffmpeg HLS bad identifier: %s", err)
-            return web.Response(text=str(err), status=HTTPStatus.BAD_REQUEST)
-        _LOGGER.info(
-            "Reolink ffmpeg HLS opening clip url=%s",
-            clip_url,
-        )
-
-        await _ensure_cleanup_task(self.hass)
-        transcode = request.query.get("transcode")
-        if transcode is None:
-            transcode_flag = DEFAULT_TRANSCODE
-        else:
-            transcode_flag = transcode not in ("0", "false", "False", "", None)
-        try:
-            token = await _spawn_hls(self.hass, clip_url, transcode_flag)
-        except FileNotFoundError:
-            return web.Response(
-                text="ffmpeg not found in PATH",
-                status=HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
-
-        async with STREAMS_LOCK:
-            data = STREAMS.get(token)
-            if data:
-                data["last_access"] = time.time()
-        if not data:
-            return web.Response(
-                text="Failed to start HLS stream",
-                status=HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
-        file_path, status, message = await _wait_hls_ready(data, "index.m3u8")
-        if not file_path:
-            return web.Response(text=message or "Playlist not ready", status=status)
-
-        base_path = f"/api/reolink_proxy/hls_stream/{token}/"
-        base_url = str(request.url.with_path(base_path).with_query(""))
-        auth_suffix = f"?{request.query_string}" if request.query_string else ""
-        playlist = await asyncio.to_thread(file_path.read_text)
-        rewritten: list[str] = []
-        for line in playlist.splitlines():
-            if not line.strip():
-                rewritten.append(line)
-                continue
-            if line.startswith("#EXT-X-MAP:URI="):
-                uri_part = line.split("URI=", 1)[-1].strip()
-                if uri_part.startswith("\"") and "\"" in uri_part[1:]:
-                    uri = uri_part.split("\"", 2)[1]
-                    if not uri.startswith(("http://", "https://", "/")):
-                        line = line.replace(uri, base_url + uri + auth_suffix)
-                rewritten.append(line)
-                continue
-            if line.startswith("#"):
-                rewritten.append(line)
-                continue
-            rewritten.append(base_url + line + auth_suffix)
-        body = "\n".join(rewritten).encode()
-        headers = {
-            "Content-Type": "application/vnd.apple.mpegurl",
-            "Cache-Control": "no-store",
-            "Content-Length": str(len(body)),
-        }
-        return web.Response(body=body, headers=headers)
-
-
 class ReolinkMp4ProxyView(HomeAssistantView):
     """Proxy Reolink MP4 clips with Range support for Safari."""
 
@@ -750,41 +468,9 @@ class ReolinkMp4ProxyView(HomeAssistantView):
             with suppress(RuntimeError, ConnectionResetError):
                 await response.write_eof()
         return response
-class ReolinkFfmpegHlsStreamView(HomeAssistantView):
-    """Serve HLS playlists/segments generated by ffmpeg."""
-
-    requires_auth = False
-    url = "/api/reolink_proxy/hls_stream/{token}/{filename:.*}"
-    name = "api:reolink_proxy_hls_stream"
-
-    def __init__(self, hass: HomeAssistant) -> None:
-        self.hass = hass
-
-    async def get(self, request: web.Request, token: str, filename: str) -> web.StreamResponse:
-        async with STREAMS_LOCK:
-            data = STREAMS.get(token)
-        if not data:
-            return web.Response(text="HLS stream not found", status=HTTPStatus.NOT_FOUND)
-
-        data["last_access"] = time.time()
-        file_path, status, message = await _wait_hls_ready(data, filename)
-        if not file_path:
-            return web.Response(text=message or "Segment not ready", status=status)
-
-        if filename.endswith(".m3u8"):
-            content_type = "application/vnd.apple.mpegurl"
-        elif filename.endswith((".m4s", ".mp4")):
-            content_type = "video/mp4"
-        else:
-            content_type = "application/octet-stream"
-
-        headers = {"Content-Type": content_type, "Cache-Control": "no-store"}
-        return web.FileResponse(path=file_path, headers=headers)
 
 
 __all__ = [
-    "ReolinkFfmpegHlsView",
-    "ReolinkFfmpegHlsStreamView",
     "ReolinkMp4ProxyView",
     "generate_ffmpeg_proxy_url",
 ]
