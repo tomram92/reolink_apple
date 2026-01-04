@@ -5,13 +5,7 @@ from __future__ import annotations
 import logging
 
 import homeassistant.components.reolink as core_reolink
-import homeassistant.components.reolink.views as core_views
 
-from .views import (
-    Go2rtcPlaybackProxyView,
-    Go2rtcProxyView,
-    async_generate_playback_proxy_url,
-)
 from .proxy_view import (
     ReolinkFfmpegHlsStreamView,
     ReolinkFfmpegHlsView,
@@ -35,15 +29,9 @@ async def async_setup_entry(
     """Set up Reolink while swapping in the go2rtc-backed playback proxy."""
     _LOGGER.info("Custom Reolink setup entry started")
 
-    # Swap the view used inside the core integration before delegating to it.
-    core_reolink.PlaybackProxyView = Go2rtcPlaybackProxyView
-    core_views.PlaybackProxyView = Go2rtcPlaybackProxyView
-    core_views.async_generate_playback_proxy_url = async_generate_playback_proxy_url
-    _LOGGER.debug("Reolink playback proxy patched to use go2rtc")
 
     result = await core_reolink.async_setup_entry(hass, config_entry)
     if result:
-        hass.http.register_view(Go2rtcProxyView(hass))
         hass.http.register_view(ReolinkFfmpegHlsView(hass))
         hass.http.register_view(ReolinkFfmpegHlsStreamView(hass))
         hass.http.register_view(ReolinkMp4ProxyView(hass))

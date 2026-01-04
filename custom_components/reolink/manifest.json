@@ -1,7 +1,7 @@
 {
   "domain": "reolink",
-  "name": "Reolink (go2rtc playback interceptor)",
-  "version": "0.0.2",
+  "name": "Reolink (range bytes support)",
+  "version": "1.0.0",
   "documentation": "https://www.home-assistant.io/integrations/reolink",
   "requirements": ["reolink-aio==0.17.1"],
   "dependencies": ["http", "webhook"],
