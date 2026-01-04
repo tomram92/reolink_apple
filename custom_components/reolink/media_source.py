@@ -64,28 +64,13 @@ class ReolinkVODMediaSource(core_media_source.ReolinkVODMediaSource):
         if not item.identifier:
             raise Unresolvable("Missing media identifier")
 
-        _LOGGER.warning(
-            "Reolink media_source identifier_raw %r",
-            item.identifier,
-        )
         parts = item.identifier.split("|", 7)
         if len(parts) not in (7, 8) or parts[0] != "FILE":
-            _LOGGER.warning(
-                "Reolink media_source non-file identifier %s",
-                item.identifier,
-            )
             return await super().async_resolve_media(item)
 
         size = None
         if len(parts) == 8 and parts[7].isdigit():
             size = int(parts[7])
-        _LOGGER.warning("Reolink media_source parts %s", parts[6])
-        _LOGGER.warning("Reolink media_source size %s", size)
-        _LOGGER.warning("Reolink media_source resolved mp4 via Range proxy")
-        _LOGGER.warning(
-            "Reolink media_source identifier %s",
-            item.identifier,
-        )
         proxy_url = generate_ffmpeg_proxy_url(item.identifier)
         if size is not None:
             proxy_url = f"{proxy_url}?size={size}"
@@ -164,7 +149,6 @@ class ReolinkVODMediaSource(core_media_source.ReolinkVODMediaSource):
             if isinstance(size, str) and size.isdigit():
                 size = int(size)
             size_part = str(size) if isinstance(size, int) else ""
-            _LOGGER.warning("Reolink generate file size %s", size)
             identifier = (
                 f"FILE|{config_entry_id}|{channel}|{stream}|{file.file_name}"
                 f"|{file.start_time_id}|{file.end_time_id}"
@@ -172,12 +156,6 @@ class ReolinkVODMediaSource(core_media_source.ReolinkVODMediaSource):
             if size_part:
                 identifier = f"{identifier}|{size_part}"
 
-            _LOGGER.warning(
-                "Reolink generate identifier filename=%s size=%s id=%s",
-                file.file_name,
-                size,
-                identifier,
-            )
             children.append(
                 BrowseMediaSource(
                     domain=core_media_source.DOMAIN,
