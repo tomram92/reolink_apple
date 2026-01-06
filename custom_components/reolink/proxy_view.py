@@ -1,4 +1,4 @@
-"""Proxy Reolink VOD through HLS and MP4 Range endpoints."""
+"""Proxy Reolink VOD through a remuxed MP4 endpoint."""
 
 from __future__ import annotations
 
@@ -24,13 +24,14 @@ from .util import get_host
 
 _LOGGER = logging.getLogger(__name__)
 
-HLS_TIME = 1
-HLS_LIST_SIZE = 4
-HLS_SEGMENT_TYPE = os.getenv("REOLINK_HLS_SEGMENT_TYPE", "fmp4")
-HLS_FLAGS = "append_list+omit_endlist+independent_segments"
-HLS_READY_TIMEOUT = float(os.getenv("REOLINK_HLS_READY_TIMEOUT", "20"))
+MP4_READY_TIMEOUT = float(
+    os.getenv("REOLINK_MP4_READY_TIMEOUT", os.getenv("REOLINK_HLS_READY_TIMEOUT", "20"))
+)
+MP4_MIN_READY_BYTES = int(os.getenv("REOLINK_MP4_MIN_READY_BYTES", "65536"))
 STREAM_TTL_SECONDS = 300
-DEFAULT_TRANSCODE = os.getenv("REOLINK_HLS_TRANSCODE", "0") not in (
+DEFAULT_TRANSCODE = os.getenv(
+    "REOLINK_MP4_TRANSCODE", os.getenv("REOLINK_HLS_TRANSCODE", "0")
+) not in (
     "0",
     "false",
     "False",
@@ -75,10 +76,10 @@ def _vod_type_for_file(host, filename: str) -> VodRequestType:
     return VodRequestType.RTMP
 
 
-def generate_ffmpeg_hls_url(identifier: str) -> str:
-    """Build the HLS proxy URL for a media identifier."""
+def generate_ffmpeg_mp4_url(identifier: str) -> str:
+    """Build the MP4 proxy URL for a media identifier."""
     encoded = quote(identifier, safe="")
-    return f"/api/reolink/hls/{encoded}"
+    return f"/api/reolink/mp4/{encoded}"
 
 
 async def _resolve_clip_url(
@@ -120,7 +121,7 @@ async def _resolve_clip_url(
 
 
 def _stream_root(hass: HomeAssistant) -> Path:
-    return Path(hass.config.path("reolink_hls"))
+    return Path(hass.config.path("reolink_mp4"))
 
 
 async def _ensure_cleanup_task(hass: HomeAssistant) -> None:
@@ -149,7 +150,7 @@ async def _stop_stream(token: str) -> None:
     if not data:
         return
 
-    _LOGGER.info("Stopping HLS stream %s", token)
+    _LOGGER.info("Stopping MP4 stream %s", token)
     proc: asyncio.subprocess.Process = data["process"]
     if proc.returncode is None:
         proc.terminate()
@@ -168,22 +169,12 @@ async def _stop_stream(token: str) -> None:
         stream_dir.rmdir()
 
 
-async def _spawn_hls(hass: HomeAssistant, clip_url: str, transcode: bool) -> str:
+async def _spawn_mp4(hass: HomeAssistant, clip_url: str, transcode: bool) -> str:
     token = secrets.token_hex(8)
     stream_dir = _stream_root(hass) / token
     stream_dir.mkdir(parents=True, exist_ok=True)
 
-    playlist = stream_dir / "index.m3u8"
-    segment_type = HLS_SEGMENT_TYPE.lower()
-    if segment_type in ("ts", "mpegts"):
-        ffmpeg_segment_type = "mpegts"
-        segment_pattern = stream_dir / "seg%03d.ts"
-        init_name = None
-    else:
-        ffmpeg_segment_type = "fmp4"
-        segment_pattern = stream_dir / "seg%03d.m4s"
-        init_name = "init.mp4"
-
+    output_path = stream_dir / "clip.mp4"
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -196,30 +187,9 @@ async def _spawn_hls(hass: HomeAssistant, clip_url: str, transcode: bool) -> str
         "0:v:0",
         "-map",
         "0:a:0?",
-        "-f",
-        "hls",
-        "-hls_time",
-        str(HLS_TIME),
-        "-hls_list_size",
-        str(HLS_LIST_SIZE),
-        "-hls_flags",
-        HLS_FLAGS,
-        "-hls_segment_type",
-        ffmpeg_segment_type,
     ]
-    if init_name:
-        cmd += [
-            "-hls_fmp4_init_filename",
-            init_name,
-        ]
-    cmd += [
-        "-hls_segment_filename",
-        str(segment_pattern),
-        str(playlist),
-    ]
-    insert_at = cmd.index("-f")
     if transcode:
-        cmd[insert_at:insert_at] = [
+        cmd += [
             "-c:v",
             "libx264",
             "-preset",
@@ -248,12 +218,19 @@ async def _spawn_hls(hass: HomeAssistant, clip_url: str, transcode: bool) -> str
             "128k",
         ]
     else:
-        cmd[insert_at:insert_at] = [
+        cmd += [
             "-c:v",
             "copy",
             "-c:a",
             "copy",
         ]
+    cmd += [
+        "-movflags",
+        "+frag_keyframe+empty_moov+default_base_moof",
+        "-f",
+        "mp4",
+        str(output_path),
+    ]
 
     process = await asyncio.create_subprocess_exec(
         *cmd,
@@ -267,62 +244,38 @@ async def _spawn_hls(hass: HomeAssistant, clip_url: str, transcode: bool) -> str
             "dir": stream_dir,
             "process": process,
             "last_access": time.time(),
+            "output": output_path,
         }
 
-    _LOGGER.info("Started HLS stream %s for %s", token, clip_url)
+    _LOGGER.info("Started MP4 remux stream %s for %s", token, clip_url)
     return token
 
 
-async def _wait_hls_ready(
-    data: dict[str, object], filename: str
+async def _wait_mp4_ready(
+    data: dict[str, object],
 ) -> tuple[Path | None, int, str | None]:
-    file_path = Path(data["dir"]) / filename
+    file_path = Path(data["output"])
     proc: asyncio.subprocess.Process = data["process"]
 
     start_wait = time.time()
-    while time.time() - start_wait < HLS_READY_TIMEOUT:
+    while time.time() - start_wait < MP4_READY_TIMEOUT:
         if file_path.is_file():
-            break
+            try:
+                if file_path.stat().st_size >= MP4_MIN_READY_BYTES:
+                    break
+            except OSError:
+                pass
         if proc.returncode is not None:
             message = f"ffmpeg exited early (code {proc.returncode})"
             return None, 502, message
         await asyncio.sleep(0.2)
     if not file_path.is_file():
-        return None, 503, "HLS output not ready"
-
-    if filename.endswith(".m3u8"):
-        start_wait = time.time()
-        while time.time() - start_wait < HLS_READY_TIMEOUT:
-            content = await asyncio.to_thread(file_path.read_text)
-            segments: list[str] = []
-            init_file: str | None = None
-            for line in content.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                if line.startswith("#EXT-X-MAP:URI="):
-                    uri_part = line.split("URI=", 1)[-1].strip()
-                    if uri_part.startswith("\"") and "\"" in uri_part[1:]:
-                        init_file = uri_part.split("\"", 2)[1]
-                    else:
-                        init_file = uri_part
-                    continue
-                if line.startswith("#"):
-                    continue
-                segments.append(line)
-            ready = len(segments) >= 2
-            paths_to_check: list[Path] = []
-            if init_file:
-                paths_to_check.append(Path(data["dir"]) / init_file)
-            if ready:
-                paths_to_check.extend(Path(data["dir"]) / seg for seg in segments[:2])
-            if ready and any(not path.is_file() for path in paths_to_check):
-                ready = False
-            if ready:
-                break
-            await asyncio.sleep(0.2)
-        else:
-            return None, 503, "Playlist not ready"
+        return None, 503, "MP4 output not ready"
+    try:
+        if file_path.stat().st_size < MP4_MIN_READY_BYTES:
+            return None, 503, "MP4 output too small"
+    except OSError:
+        return None, 503, "MP4 output not ready"
 
     last_size = -1
     stable_start = time.time()
@@ -339,28 +292,28 @@ async def _wait_hls_ready(
     return file_path, 200, None
 
 
-class ReolinkFfmpegHlsView(HomeAssistantView):
-    """Proxy Reolink clips through ffmpeg and serve as HLS."""
+class ReolinkFfmpegMp4View(HomeAssistantView):
+    """Proxy Reolink clips through ffmpeg and serve as MP4."""
 
     # Match MP4 proxy: Safari is redirected here and may not include auth headers.
     requires_auth = False
-    url = "/api/reolink/hls/{identifier:.*}"
-    name = "api:reolink_proxy_hls"
+    url = "/api/reolink/mp4/{identifier:.*}"
+    name = "api:reolink_proxy_mp4"
 
     def __init__(self, hass: HomeAssistant) -> None:
         self.hass = hass
 
     async def get(self, request: web.Request, identifier: str) -> web.StreamResponse:
         """Fetch a Reolink clip and re-mux it for HLS playback."""
-        _LOGGER.info("Reolink ffmpeg HLS proxy request received")
+        _LOGGER.info("Reolink ffmpeg MP4 proxy request received")
         try:
-            _LOGGER.debug("Reolink ffmpeg HLS proxy identifier=%s", identifier)
+            _LOGGER.debug("Reolink ffmpeg MP4 proxy identifier=%s", identifier)
             clip_url, _vod_type, _ = await _resolve_clip_url(self.hass, identifier)
         except (ValueError, Unresolvable, ReolinkError) as err:
-            _LOGGER.warning("Reolink ffmpeg HLS bad identifier: %s", err)
+            _LOGGER.warning("Reolink ffmpeg MP4 bad identifier: %s", err)
             return web.Response(text=str(err), status=HTTPStatus.BAD_REQUEST)
         _LOGGER.info(
-            "Reolink ffmpeg HLS opening clip url=%s",
+            "Reolink ffmpeg MP4 opening clip url=%s",
             clip_url,
         )
 
@@ -371,7 +324,7 @@ class ReolinkFfmpegHlsView(HomeAssistantView):
         else:
             transcode_flag = transcode not in ("0", "false", "False", "", None)
         try:
-            token = await _spawn_hls(self.hass, clip_url, transcode_flag)
+            token = await _spawn_mp4(self.hass, clip_url, transcode_flag)
         except FileNotFoundError:
             return web.Response(
                 text="ffmpeg not found in PATH",
@@ -384,19 +337,19 @@ class ReolinkFfmpegHlsView(HomeAssistantView):
                 data["last_access"] = time.time()
         if not data:
             return web.Response(
-                text="Failed to start HLS stream",
+                text="Failed to start MP4 stream",
                 status=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
         auth_suffix = f"?{request.query_string}" if request.query_string else ""
-        redirect_url = f"/api/reolink/hls_stream/{token}/index.m3u8{auth_suffix}"
+        redirect_url = f"/api/reolink/mp4_stream/{token}/clip.mp4{auth_suffix}"
         raise web.HTTPFound(location=redirect_url)
 
-class ReolinkFfmpegHlsStreamView(HomeAssistantView):
-    """Serve HLS playlists/segments generated by ffmpeg."""
+class ReolinkFfmpegMp4StreamView(HomeAssistantView):
+    """Serve MP4 output generated by ffmpeg."""
 
     requires_auth = False
-    url = "/api/reolink/hls_stream/{token}/{filename:.*}"
-    name = "api:reolink_proxy_hls_stream"
+    url = "/api/reolink/mp4_stream/{token}/{filename:.*}"
+    name = "api:reolink_proxy_mp4_stream"
 
     def __init__(self, hass: HomeAssistant) -> None:
         self.hass = hass
@@ -405,31 +358,21 @@ class ReolinkFfmpegHlsStreamView(HomeAssistantView):
         async with STREAMS_LOCK:
             data = STREAMS.get(token)
         if not data:
-            return web.Response(text="HLS stream not found", status=HTTPStatus.NOT_FOUND)
+            return web.Response(text="MP4 stream not found", status=HTTPStatus.NOT_FOUND)
 
         data["last_access"] = time.time()
-        file_path, status, message = await _wait_hls_ready(data, filename)
+        if filename != "clip.mp4":
+            return web.Response(text="MP4 file not found", status=HTTPStatus.NOT_FOUND)
+        file_path, status, message = await _wait_mp4_ready(data)
         if not file_path:
             return web.Response(text=message or "Segment not ready", status=status)
 
-        if filename.endswith(".m3u8"):
-            content_type = "application/vnd.apple.mpegurl"
-        elif filename.endswith((".m4s", ".mp4")):
-            content_type = "video/mp4"
-        elif filename.endswith(".ts"):
-            content_type = "video/MP2T"
-        else:
-            content_type = "application/octet-stream"
-
-        headers = {"Content-Type": content_type, "Cache-Control": "no-store"}
-        if request.headers.get("Range"):
-            body = await asyncio.to_thread(file_path.read_bytes)
-            return web.Response(body=body, headers=headers)
+        headers = {"Content-Type": "video/mp4", "Cache-Control": "no-store"}
         return web.FileResponse(path=file_path, headers=headers)
 
 
 __all__ = [
-    "ReolinkFfmpegHlsView",
-    "ReolinkFfmpegHlsStreamView",
-    "generate_ffmpeg_hls_url",
+    "ReolinkFfmpegMp4View",
+    "ReolinkFfmpegMp4StreamView",
+    "generate_ffmpeg_mp4_url",
 ]

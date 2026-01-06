@@ -1,4 +1,4 @@
-"""Media source override to route Reolink MP4 clips through a Range proxy."""
+"""Media source override to route Reolink clips through a remuxed MP4 proxy."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from homeassistant.components.media_source import (
 )
 import homeassistant.components.reolink.media_source as core_media_source
 
-from .proxy_view import generate_ffmpeg_hls_url
+from .proxy_view import generate_ffmpeg_mp4_url
 
 _LOGGER = logging.getLogger(__name__)
 VOD_SPLIT_TIME = dt.timedelta(minutes=5)
@@ -44,7 +44,7 @@ class ReolinkVODMediaSource(core_media_source.ReolinkVODMediaSource):
         if len(parts) not in (7, 8) or parts[0] != "FILE":
             return await super().async_resolve_media(item)
 
-        proxy_url = self._sign_path(generate_ffmpeg_hls_url(item.identifier))
-        return PlayMedia(proxy_url, "application/x-mpegURL")
+        proxy_url = self._sign_path(generate_ffmpeg_mp4_url(item.identifier))
+        return PlayMedia(proxy_url, "video/mp4")
 
         return await super().async_resolve_media(item)

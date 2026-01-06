@@ -6,8 +6,8 @@ import logging
 
 import homeassistant.components.reolink as core_reolink
 from .proxy_view import (
-    ReolinkFfmpegHlsStreamView,
-    ReolinkFfmpegHlsView,
+    ReolinkFfmpegMp4StreamView,
+    ReolinkFfmpegMp4View,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -27,7 +27,7 @@ async def async_setup_entry(
     """Set up Reolink with extra Apple endpoints."""
     result = await core_reolink.async_setup_entry(hass, config_entry)
     if result:
-        hass.http.register_view(ReolinkFfmpegHlsView(hass))
-        hass.http.register_view(ReolinkFfmpegHlsStreamView(hass))
-        _LOGGER.info("Registered Apple HLS playback")
+        hass.http.register_view(ReolinkFfmpegMp4View(hass))
+        hass.http.register_view(ReolinkFfmpegMp4StreamView(hass))
+        _LOGGER.info("Registered Apple MP4 playback")
     return result
